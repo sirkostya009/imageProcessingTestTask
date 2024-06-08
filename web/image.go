@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/image/draw"
@@ -14,12 +15,15 @@ import (
 
 var volumePath = os.Getenv("VOLUME_PATH")
 
-func resizeAndWriteImage(src image.Image, size int, uid int32, tx *db.Queries, lock *sync.Mutex) error {
+func resizeAndWriteImage(src image.Image, size int, uid int32, tx *db.Queries, lock *sync.Mutex, ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return nil
+	}
 	dst := image.NewRGBA(image.Rect(0, 0, size, size))
 	draw.ApproxBiLinear.Scale(dst, dst.Rect, src, src.Bounds(), draw.Over, nil)
 	path := fmt.Sprintf("%s/%d/%d.jpg", volumePath, uid, size)
 	lock.Lock()
-	err := tx.CreateImage(context.Background(), db.CreateImageParams{
+	err := tx.CreateImage(ctx, db.CreateImageParams{
 		UserID: uid,
 		Url:    path,
 	})
@@ -73,32 +77,34 @@ func (h *Handlers) UploadImage(c echo.Context) error {
 		return echo.ErrInternalServerError
 	}
 
-	var hasErrors bool
 	var wg sync.WaitGroup
 	var lock sync.Mutex
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	for i := range 5 {
 		go func() {
+			defer wg.Done()
 			for j := range 10 {
-				if err := resizeAndWriteImage(img, 30+i*10+j, uid, qtx, &lock); err != nil {
+				if err := resizeAndWriteImage(img, 30+i*10+j, uid, qtx, &lock, ctx); err != nil {
 					fmt.Println(err)
-					hasErrors = true
+					cancel()
+					return
 				}
 			}
-			wg.Done()
 		}()
 		wg.Add(1)
 	}
 
-	if err = resizeAndWriteImage(img, 80, uid, qtx, &lock); err != nil {
+	if err = resizeAndWriteImage(img, 80, uid, qtx, &lock, ctx); err != nil {
 		fmt.Println(err)
-		hasErrors = true
+		cancel()
 	}
 
 	wg.Wait()
 
-	if hasErrors {
-		return echo.NewHTTPError(500, "not all images were saved")
+	if ctx.Err() != nil {
+		return echo.NewHTTPError(500, "images were not saved")
 	} else {
 		err = tx.Commit(ctx)
 		if err != nil {
